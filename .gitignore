@@ -1,0 +1,31 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+config/config.json
+**/auth/
+**/credentials/
+**/.tokens/
+# Runtime state
+*.db
+*.sqlite
+*.sqlite3
+*.db-*
+receipts/
+logs/
+*.log
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+# Unreviewed historical evidence
+archive/**/evidence/
