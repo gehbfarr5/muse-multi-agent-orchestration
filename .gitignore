@@ -10,6 +10,8 @@ config/config.json
 **/credentials/
 **/.tokens/
 # Runtime state
+state/
+work/
 *.db
 *.sqlite
 *.sqlite3

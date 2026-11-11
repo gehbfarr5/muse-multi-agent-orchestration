@@ -1,0 +1,8 @@
+# Dependency for the full test suite and real PNG verification.
+# Install with:
+#   pip install -r requirements-test.txt
+# In an offline environment, install from a local wheel instead:
+#   pip install --no-index --find-links <wheel-dir> "Pillow==12.2.0"
+# Verified 2026-11-11: Pillow 12.2.0 (wheel
+# pillow-12.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl).
+Pillow==12.2.0

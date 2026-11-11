@@ -1,0 +1,5 @@
+name: "muse_orchestration"
+title: "MUSE Multi-Agent Orchestration"
+description: "Route a natural-language task to agy, Grok or Codex through the restricted orchestration entry, or handle it directly in Muse, with a security gate, SQLite receipts and rollback. Image generation (generate an image, draw a picture, 生成图片) routes to Codex; real image generation is off by default. 多 Agent 编排：日语文案、中文创作、X 趋势、图片生成、Agent 委派。"
+category: "Work and knowledge"
+include_in_prompt: false

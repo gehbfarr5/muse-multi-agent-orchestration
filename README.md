@@ -1,36 +1,117 @@
 # MUSE Multi-Agent Orchestration
 
-A lightweight, safety-gated orchestration system for delegating selected MUSE tasks to external CLI agents.
+A lightweight, safety-gated orchestration system for delegating selected
+natural-language tasks to external CLI agents — `agy` (content), Grok
+(public X/Twitter research), and Codex (image tasks) — with task
+classification, an approval/security gate, SQLite task state, adapters,
+output validation, receipts, and failure recovery.
 
-> **Release status:** Repository initialization. The reviewed R5 source snapshot has **not yet been published**. This repository is not yet an installable release.
+> **Release status:** `v1.0.0-rc1` is a public release candidate. See
+> [release notes](docs/RELEASE.md) and the [MIT License](LICENSE).
 
-## Architecture
+## What it does
 
-MUSE remains the single orchestrator. Its routing layer can delegate eligible tasks to:
+MUSE stays the single orchestrator. For each natural-language task it:
 
-- **agy** — Japanese writing and selected content work.
-- **Grok CLI** — public X/trend research within restricted tool permissions.
-- **Codex CLI** — image-task mock workflow only; live image generation is not enabled.
+1. Classifies the capability (direct handling, Japanese/Chinese writing,
+   content review, public X research, or image generation).
+2. Runs a deterministic security screen (PII, credential paths,
+   production paths, external-send intents) before any delegation.
+3. Routes to the matching agent through a fixed contract (pinned CLI
+   version, tool allowlist, timeout, retry budget).
+4. Executes the CLI, validates the output, records the task state and
+   a receipt, and returns the result — or falls back to MUSE on failure.
 
-The system uses task classification, approval/security gates, SQLite task state, adapters, output validation, receipts, and recovery controls.
+## Verified capabilities
 
-## Verified project history
+| Capability | Maturity |
+|---|---|
+| Direct MUSE handling of simple tasks | PROVEN_LIVE |
+| agy Japanese writing / Chinese writing + review (single call) | PROVEN_LIVE |
+| Grok public X/Twitter research | PROVEN_LIVE |
+| Codex image tasks (simulated by default; real generation off) | PROVEN_LIVE (simulated) / MOCK_VERIFIED (real path, one controlled run) |
+| Task contracts, state machine, receipts, dedup, breaker | PROVEN_LIVE |
+| Sensitive-information gate | PROVEN_LIVE (leakage surface not fully covered — see R-7) |
 
-- **R3:** Local orchestration integration and test harness.
-- **R4:** Skill activation, routing fixes, and fresh-session validation.
-- **R4-G:** Japanese writing routed to agy in a real new session; simple Chinese editing handled directly by MUSE (per project acceptance report).
-- **R5:** Public GitHub source-review and release preparation.
+See `docs/RELEASE.md` for the full freeze matrix and `docs/CHANGELOG.md`
+for the R1–R7 history. "Chinese writing + review" is one agy call that
+contains both instructions, not a two-stage pipeline.
 
-These are historical project-reported outcomes, not independent production certification.
+## Requirements
 
-## Safety boundaries
+- Python 3.12+. Text orchestration and simulated images use the Python
+  standard library.
+- **Full test suite and real PNG verification need Pillow 12.2.0**
+  (see `requirements-test.txt`). Without it the
+  suite reports 5 import errors in the image tests; with it the
+  suite runs 220 tests. Install with
+  `pip install -r requirements-test.txt`, or offline from a local
+  wheel: `pip install --no-index --find-links <wheel-dir>
+  "Pillow==12.2.0"`.
+- One or more of the external CLIs, only if you want to run real tasks:
+  `agy` 1.5.5, `grok` 1.0.77, `codex` 0.164.0-alpha.9. They are **not**
+  bundled; the code pins these versions and refuses to run an agent
+  whose CLI is missing or reports a different version.
+- No network access is required for the test suite (mocked).
+- **Supported platform: Linux x86_64, Python 3.12 (verified).**
+  macOS is not tested and has a known degraded residual-process scan
+  (no `/proc` for zombie detection — see `docs/SOURCES.md`).
 
-No real customer personal data may be sent to external CLIs. Real Codex image generation and production cron migration are not enabled. Existing production schedules must not be changed by this repository.
+## Quick start
 
-## Publication policy
+```bash
+git clone https://github.com/gehbfarr5/muse-multi-agent-orchestration
+cd muse-multi-agent-orchestration
+cp config/config.json.example config/config.json   # edit paths only
+python3 muse_orchestrate.py health
+python3 muse_orchestrate.py run "把这句中文改写为日语：今天天气很好，我去公园散步。"
+python3 muse_orchestrate.py tasks
+python3 muse_orchestrate.py receipts <task_id>
+```
 
-Only reviewed source, sanitized examples, and relevant documentation will be published. Live databases, credentials, CLI authentication state, raw receipts, personal data, and potentially sensitive probe logs are excluded.
+**External calls are off by default.** With the template config (or
+no `config/config.json` at all), `run` handles simple tasks locally
+and refuses delegation with `external_calls_disabled` — no agent is
+called. To enable delegation, set `"external_calls_enabled": true`
+in `config/config.json`. Enabling it does not bypass the security
+gate, the pinned version check, or the separate real-image flag.
+See `docs/OPERATIONS.md`.
 
-## Next steps
+Image tasks produce a **simulated** local PNG by default. Real Codex
+image generation is off by default and requires an explicit,
+per-task, operator-controlled enable — see `docs/OPERATIONS.md`.
+There is no automatic retry of real generation.
 
-Publish the sanitized R5 source baseline, run portable tests, document environment-dependent CLI checks, then create the first tagged release. No release tag is assigned yet.
+## Tests
+
+```bash
+pip install -r requirements-test.txt   # Pillow 12.2.0
+python3 -m unittest discover -s tests
+```
+
+The suite is offline and mocked (no real agent calls, no production
+credentials, no network). Expected result with Pillow 12.2.0: **220
+tests, OK (skipped=3)** — the 3 skipped tests are the CLI
+version-parse tests, which skip by design when the pinned CLI is not
+installed. Without Pillow the suite reports 5 import errors in the
+image tests (3 modules fail to import, 2 fixture tests fail); the
+production baseline ran 205/205; the candidate's own
+clean-environment result is recorded in `docs/RELEASE.md` and may
+differ if the environment lacks the pinned CLIs — version-dependent
+tests report `NOT_INSTALLED` instead of passing silently.
+
+## Safety boundaries (read first)
+
+- Never send real customer personal data to an external CLI. The gate
+  blocks phone numbers, ID numbers, credential paths, and production
+  paths, but its coverage is not complete (R-7).
+- CLI-level permission restrictions are **not** an OS sandbox. Codex
+  has no read boundary (R-1); low-privilege UID/userns isolation is
+  unverified (R-6).
+- Existing production schedules (Grok crons) are out of scope and must
+  not be changed by this repository.
+- Do not commit tokens, OAuth credentials, CLI login state, production
+  SQLite databases, receipts, or raw runtime logs (see `.gitignore`).
+
+Full details: `SECURITY.md`, `docs/ARCHITECTURE.md`,
+`docs/OPERATIONS.md`, `docs/SOURCES.md`.

@@ -1,0 +1,430 @@
+"""Codex adapter (Codex CLI 0.164.0-alpha.9, home copy with codex-code-mode-host)
+— R2-D hardened.
+
+R2-C measured (R2C-SECURITY-AUDIT §4):
+- Write boundary is kernel-enforced: workspace-write denies writes outside
+  cwd (except /tmp, which is a configured writable root); read-only denies
+  all writes. (H4 retest, R2-C C3b–C3d.)
+- Read boundary does NOT exist: read-only and workspace-write both read
+  the whole filesystem, including HOME and credential dirs (R2-C C2, C4).
+  This module NEVER claims read isolation. The control is hygiene only:
+  never pass sensitive paths, never run with a cwd that contains secrets.
+- image_gen writes to $CODEX_HOME/generated_images/ by default (skill doc);
+  the sandbox does not constrain the built-in tool's output path
+  (UNVERIFIED at runtime — H5 DEFERRED, no real generation in R2-D).
+  Artifacts must be copied into the task work dir by MUSE and validated
+  with validate_png(); guard_artifact_path() refuses any path outside it.
+
+Hard rules (R2A + R2-D):
+- Model pinned: gpt-6.1-sol, always explicit with -m. Never changed.
+- Binary: ~/workspace/tools/codex-bin/codex (home copy; /opt image copy
+  lacks codex-code-mode-host and fails all tool calls closed).
+- Sandbox: -s read-only for text, -s workspace-write for image drafts,
+  NEVER danger-full-access, NEVER --dangerously-bypass-approvals-and-sandbox.
+- Work dir MUST be under ~/workspace and MUST NOT be under /tmp.
+  /tmp is a writable root under workspace-write: tasks sharing /tmp can
+  contaminate each other. Fail-closed on violation.
+- stdin always /dev/null (exec waits on stdin EOF otherwise).
+- NO real image generation in R2-D (H5 DEFERRED). This module implements the
+  call contract + simulated image-product validation only: validate_png()
+  checks a PNG file's mode/alpha/transparency; it is run against mock
+  fixtures produced locally, never against a live generation.
+"""
+import hashlib
+import os
+import shutil
+
+from .adapter_base import run_process
+
+CODEX_BIN = os.path.expanduser("~/workspace/tools/codex-bin/codex")
+PINNED_MODEL = "gpt-6.1-sol"
+PINNED_VERSION = "0.164.0-alpha.9"
+FORBIDDEN_TOKENS = {
+    "--dangerously-bypass-approvals-and-sandbox",
+    "danger-full-access",
+    "--dangerously-bypass-hook-trust",
+}
+# Isolation root: task work dirs must live under the workspace, never /tmp.
+WORKSPACE_ROOT = os.path.realpath(os.path.expanduser("~/workspace"))
+
+# --- Real image generation (R6-C) ---------------------------------------
+# Codex writes generated images here (session subdirectories); the path is
+# fixed by the CLI, never taken from user input or model output.
+GENERATED_IMAGES_DIR = os.path.realpath(
+    os.path.expanduser("~/.codex/generated_images"))
+# Largest acceptable generated PNG (the R6-B real artifact was 1.39 MB).
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+# Feature flag: codex.real_image_generation_enabled.
+# Default OFF. Missing or invalid configuration is OFF. The flag lives
+# only in this module: it is never read from a task contract or from
+# user natural language, so no task can enable it by itself.
+CONFIG_KEY = "codex.real_image_generation_enabled"
+_REAL_IMAGE_ENABLED = False
+
+
+def configure_real_image(enabled):
+    """Explicitly set the real-image flag (isolated enablement only).
+
+    Only a literal True enables it; anything else (False, None, "true",
+    1) disables. Returns the new state.
+    """
+    global _REAL_IMAGE_ENABLED
+    _REAL_IMAGE_ENABLED = enabled is True
+    return _REAL_IMAGE_ENABLED
+
+
+def is_real_image_enabled():
+    return _REAL_IMAGE_ENABLED
+
+
+def real_image_enabled_from_config(cfg):
+    """Read the flag from a config mapping. Missing/invalid -> False.
+
+    Accepts the nested config form
+    (executors.codex.real_image_generation_enabled, as in
+    config.json.example) and the flat dotted form
+    (codex.real_image_generation_enabled). Only a literal True enables.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    if cfg.get(CONFIG_KEY) is True:
+        return True
+    ex = cfg.get("executors")
+    if isinstance(ex, dict):
+        codex = ex.get("codex")
+        if isinstance(codex, dict):
+            return codex.get("real_image_generation_enabled") is True
+    return False
+
+
+def validate_work_dir(cwd):
+    """Fail-closed work-dir check. Raises ValueError on violation.
+
+    Rules (R2-C C3b, R2-D): real path must be under ~/workspace, must not
+    be under /tmp, must not be the workspace root itself.
+    """
+    real = os.path.realpath(cwd or "")
+    if real.startswith("/tmp/") or real == "/tmp":
+        raise ValueError(f"work dir under /tmp is forbidden (writable root): {cwd}")
+    if not real.startswith(WORKSPACE_ROOT + os.sep):
+        raise ValueError(f"work dir must be under ~/workspace: {cwd}")
+    return real
+
+
+def guard_artifact_path(path, work_dir):
+    """Refuse any artifact path outside the task work dir.
+
+    Image artifacts generated by Codex land in $CODEX_HOME first; only
+    paths inside work_dir may be adopted. Raises ValueError otherwise.
+    """
+    real = os.path.realpath(path or "")
+    root = os.path.realpath(work_dir or "")
+    if not real.startswith(root + os.sep):
+        raise ValueError(f"artifact path outside work dir: {path}")
+    return real
+
+
+def build_command(contract, prompt, cwd):
+    """Build argv. Raises ValueError on violation."""
+    validate_work_dir(cwd)
+    model = contract.get("model", PINNED_MODEL)
+    if model != PINNED_MODEL:
+        raise ValueError(f"model must be {PINNED_MODEL}, got {model}")
+    sandbox = contract.get("sandbox", "read-only")
+    if sandbox not in ("read-only", "workspace-write"):
+        raise ValueError(f"sandbox not allowed: {sandbox}")
+    argv = [CODEX_BIN, "exec", "--skip-git-repo-check",
+            "-m", PINNED_MODEL, "-s", sandbox,
+            "--ephemeral", "-C", cwd, prompt]
+    for tok in argv:
+        if tok in FORBIDDEN_TOKENS:
+            raise ValueError(f"forbidden token in command: {tok}")
+    return argv
+
+
+def extract_generated_image_path(events_text):
+    """Find a Codex-generated image path inside `codex exec --json` output.
+
+    R5-B preparation only: DORMANT, not called by run(). There is no CLI
+    flag that forces image generation; the agent may call its image tool
+    during an exec session and the file lands under
+    $CODEX_HOME/generated_images/<session>/<name>.png. The exact JSONL
+    event schema for the image tool call is UNVERIFIED (no real
+    generation has been run from this entry yet), so this scans every
+    line for a generated_images PNG path instead of assuming a schema.
+    Returns the first matching absolute path, or None.
+    """
+    import re as _re
+    if not events_text:
+        return None
+    pat = _re.compile(r"(/[^\s\"']*generated_images/[^\s\"']+\.png)")
+    for line in str(events_text).splitlines():
+        m = pat.search(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def snapshot_generated_dir(gen_dir=GENERATED_IMAGES_DIR):
+    """Snapshot {path: mtime} of the controlled generation directory.
+
+    R6-B D1: `codex exec --json` never emits the generated image path,
+    so discovery compares a before/after snapshot instead of trusting
+    event text. A missing directory snapshots as empty.
+    """
+    out = {}
+    for root, _dirs, files in os.walk(gen_dir):
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                out[p] = os.path.getmtime(p)
+            except OSError:
+                continue
+    return out
+
+
+def discover_new_files(before, gen_dir=GENERATED_IMAGES_DIR):
+    """Files in gen_dir that are new or changed since `before`. Sorted."""
+    after = snapshot_generated_dir(gen_dir)
+    return sorted(p for p, m in after.items()
+                  if p not in before or before[p] != m)
+
+
+def validate_png_general(path):
+    """General PNG validity (R6-B D2): RGB or RGBA both pass.
+
+    Unlike validate_png() (transparent-background cutouts only), this
+    does NOT require an alpha channel: a white-background product photo
+    is legitimately RGB. Returns {ok, mode, size, has_alpha, error}.
+    """
+    if not os.path.isfile(path):
+        return {"ok": False, "mode": None, "size": None,
+                "has_alpha": None, "error": "file missing"}
+    with open(path, "rb") as f:
+        magic = f.read(8)
+    if magic != b"\x89PNG\r\n\x1a\n":
+        return {"ok": False, "mode": None, "size": None,
+                "has_alpha": None, "error": "not a PNG"}
+    try:
+        from PIL import Image
+    except ImportError:
+        return {"ok": False, "mode": None, "size": None,
+                "has_alpha": None, "error": "PIL unavailable"}
+    try:
+        im = Image.open(path)
+        im.load()
+    except Exception as e:
+        return {"ok": False, "mode": None, "size": None,
+                "has_alpha": None, "error": f"PIL open failed: {e}"}
+    w, h = im.size
+    if w <= 0 or h <= 0:
+        return {"ok": False, "mode": im.mode, "size": im.size,
+                "has_alpha": "A" in im.getbands(), "error": "zero dimension"}
+    return {"ok": True, "mode": im.mode, "size": im.size,
+            "has_alpha": "A" in im.getbands(), "error": None}
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def validate_png(path, min_transparent_ratio=0.0):
+    """Three-layer image acceptance (file / format / recorded-size).
+
+    Returns dict: ok, mode, size, has_alpha, transparent_ratio, error.
+    Content (semantic) acceptance is NOT done by code and is marked so.
+    Requires PIL when available; falls back to header-only checks and
+    reports alpha as UNVERIFIED instead of guessing.
+    """
+    if not os.path.isfile(path):
+        return {"ok": False, "error": "file missing"}
+    with open(path, "rb") as f:
+        magic = f.read(8)
+    if magic != b"\x89PNG\r\n\x1a\n":
+        return {"ok": False, "error": "not a PNG"}
+    try:
+        from PIL import Image
+    except ImportError:
+        return {"ok": False, "error": "PIL unavailable; alpha UNVERIFIED"}
+    try:
+        im = Image.open(path)
+        im.load()
+    except Exception as e:
+        return {"ok": False, "error": f"PIL open failed: {e}"}
+    has_alpha = "A" in im.getbands()
+    ratio = None
+    if has_alpha:
+        alpha = im.getchannel("A")
+        px = list(alpha.getdata())
+        transparent = sum(1 for v in px if v == 0)
+        ratio = transparent / max(len(px), 1)
+    ok = im.mode == "RGBA" and has_alpha and (ratio is None or ratio >= min_transparent_ratio)
+    return {"ok": ok, "mode": im.mode, "size": im.size, "has_alpha": has_alpha,
+            "transparent_ratio": ratio, "error": None,
+            "content_acceptance": "NOT_DONE_BY_CODE_requires_human_visual_check"}
+
+
+def version():
+    from .adapter_base import binary_version as _bv
+    return _bv(CODEX_BIN)
+
+
+def _run_real_image(contract, prompt, cwd):
+    """Real image generation through the Codex agent (R6-C).
+
+    Only reachable when the feature flag is on (default off). Success is
+    decided by an actual validated artifact, never by exit code 0 or by
+    the agent's words. No automatic retry happens here: the router gives
+    image contracts a retry budget of 0, so a failure falls back to MUSE.
+    """
+    from . import image_approval
+
+    validate_work_dir(cwd)
+    gen_dir = GENERATED_IMAGES_DIR
+    before = snapshot_generated_dir(gen_dir)
+    argv = build_command(contract, prompt, cwd)
+    argv = argv[:-1] + ["--json"] + argv[-1:]
+    raw = run_process(argv, timeout=contract["timeout"]["hard_seconds"],
+                      cwd=cwd, stdin_data=None)
+    raw["argv"] = argv
+    raw["read_boundary"] = "NONE - codex sandbox does not restrict reads (R2-C C2/C4)"
+    raw["writable_roots"] = ["cwd", "/tmp"]
+    raw["real_image"] = True
+
+    def fail(error, note=""):
+        """Failure result: response_text stays non-empty so the validator's
+        image rule reports INVALID_OUTPUT (unless an earlier category such
+        as TIMEOUT or NONZERO_EXIT already applies). The agent's raw
+        stdout/stderr are preserved in the receipt."""
+        check = {"ok": False, "error": error,
+                 "content_acceptance": "NOT_DONE_BY_CODE_requires_human_visual_check"}
+        raw["response_text"] = f"REAL image generation failed: {error}" + (f" ({note})" if note else "")
+        raw["artifact_path"] = None
+        raw["image_state"] = None
+        raw["image_check"] = check
+        return raw
+
+    if raw.get("timed_out"):
+        return fail("timeout")
+    if raw.get("spawn_error"):
+        return fail("spawn_failed", raw["spawn_error"])
+    if raw.get("rc") not in (0, None):
+        return fail("nonzero_exit", f"rc={raw.get('rc')}")
+    tool_path = extract_generated_image_path(raw.get("stdout", ""))
+    new_files = discover_new_files(before, gen_dir)
+    # Deterministic candidate rule (never random, never a guess):
+    # the tool path must be one of the new files; otherwise exactly one
+    # new file must exist. Zero or several candidates is a failure.
+    candidate = None
+    if tool_path:
+        if os.path.islink(tool_path):
+            return fail("symlink_candidate", tool_path)
+        real_tool = os.path.realpath(tool_path)
+        if real_tool not in [os.path.realpath(p) for p in new_files]:
+            return fail("tool_path_not_new",
+                        "tool result path is not among the new files")
+        candidate = real_tool
+    elif len(new_files) == 1:
+        if os.path.islink(new_files[0]):
+            return fail("symlink_candidate", new_files[0])
+        candidate = os.path.realpath(new_files[0])
+    elif len(new_files) == 0:
+        # Distinguish "tool unavailable" from a silent no-artifact by
+        # the agent's own words; the category stays INVALID_OUTPUT.
+        blob = (raw.get("stdout", "") or "") + "\n" + (raw.get("stderr", "") or "")
+        if "imagegen" in blob.lower() and any(
+                w in blob.lower() for w in ("unavailable", "not available", "disabled", "failed to load")):
+            return fail("tool_unavailable")
+        return fail("no_artifact")
+    else:
+        return fail("ambiguous_candidates", f"{len(new_files)} new files")
+    # Boundary checks on the candidate itself.
+    if not candidate.startswith(gen_dir + os.sep):
+        return fail("path_out_of_bounds", candidate)
+    if not os.path.isfile(candidate):
+        return fail("candidate_missing", candidate)
+    if os.path.getsize(candidate) > MAX_IMAGE_BYTES:
+        return fail("file_too_large", f"{os.path.getsize(candidate)} bytes")
+    check = validate_png_general(candidate)
+    if not check["ok"]:
+        return fail("invalid_png", check["error"])
+    # Safe copy into the isolated task work dir, then re-verify the hash.
+    dest = os.path.join(cwd, f"{contract['task_id']}.png")
+    try:
+        guard_artifact_path(dest, cwd)
+        shutil.copyfile(candidate, dest)
+    except (ValueError, OSError) as e:
+        try:
+            if os.path.isfile(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+        return fail("copy_failed", str(e))
+    if _sha256(dest) != _sha256(candidate):
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return fail("copy_hash_mismatch")
+    rgba_check = validate_png(dest)
+    check.update({"sha256": _sha256(dest), "source_path": candidate,
+                  "size_bytes": os.path.getsize(dest),
+                  "rgba_ok": rgba_check["ok"], "rgba_mode": rgba_check["mode"],
+                  "content_acceptance": "NOT_DONE_BY_CODE_requires_human_visual_check"})
+    raw["response_text"] = (
+        f"REAL image generated: {dest} "
+        f"({check['size'][0]}x{check['size'][1]} {check['mode']}, "
+        f"sha256:{check['sha256'][:12]})")
+    raw["artifact_path"] = dest
+    raw["image_state"] = "draft_generated"
+    raw["image_check"] = dict(check, ok=True)
+    return raw
+
+
+def run(contract, prompt, cwd):
+    """Text-mode exec, or image generation (R6-C).
+
+    Image tasks: when the real-image flag is OFF (default), the R3
+    simulated path runs (locally generated PNG, no CLI call). When the
+    flag is explicitly enabled in isolation, the real Codex agent path
+    runs instead. The artifact is usable only after the user explicitly
+    approves it (shown_to_user -> approved_for_use).
+    """
+    if contract.get("expected_output", {}).get("kind") == "image":
+        if is_real_image_enabled():
+            return _run_real_image(contract, prompt, cwd)
+        from . import image_approval
+        validate_work_dir(cwd)
+        artifact = os.path.join(cwd, f"{contract['task_id']}.png")
+        guard_artifact_path(artifact, cwd)
+        image_approval.generate_simulated_png(artifact)
+        check = image_approval.validate_png_header(artifact)
+        if not check["ok"]:
+            return {"rc": 1, "stdout": "", "stderr": f"simulated artifact invalid: {check['error']}",
+                    "elapsed_ms": 0, "response_text": "", "argv": ["simulated-image-gen"],
+                    "read_boundary": "NONE - codex sandbox does not restrict reads (R2-C C2/C4)",
+                    "writable_roots": ["cwd", "/tmp"]}
+        return {"rc": 0,
+                "stdout": f"SIMULATED image draft generated: {artifact}",
+                "stderr": "",
+                "elapsed_ms": 0,
+                "response_text": f"SIMULATED image draft generated: {artifact}",
+                "argv": ["simulated-image-gen"],
+                "artifact_path": artifact,
+                "image_state": "draft_generated",
+                "image_check": check,
+                "read_boundary": "NONE - codex sandbox does not restrict reads (R2-C C2/C4)",
+                "writable_roots": ["cwd", "/tmp"]}
+    argv = build_command(contract, prompt, cwd)
+    raw = run_process(argv, timeout=contract["timeout"]["hard_seconds"],
+                      cwd=cwd, stdin_data=None)
+    raw["argv"] = argv
+    # Honest audit fields: the sandbox restricts writes, NOT reads.
+    raw["read_boundary"] = "NONE - codex sandbox does not restrict reads (R2-C C2/C4)"
+    raw["writable_roots"] = ["cwd", "/tmp"]
+    return raw
